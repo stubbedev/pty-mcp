@@ -1,0 +1,196 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # musl cross-compilation needs the linker/toolchain; `cross` handles
+      # both linux targets (incl. aarch64) without host packages.
+      - name: install cross
+        if: contains(matrix.target, 'linux')
+        run: cargo install cross --locked
+      - name: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+          STAGE="pty-mcp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/${{ matrix.target }}/release/pty-mcp" "dist/$STAGE/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$STAGE/" 2>/dev/null || true
+          cd dist
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/pty-mcp-*.tar.gz*
+          retention-days: 7
+
+  cache:
+    name: push nix build to attic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - name: Build package
+        run: nix build .#pty-mcp -L --print-out-paths | tee /tmp/pty-mcp-outpaths
+      - name: Push to attic
+        continue-on-error: true
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          [ -z "${ATTIC_TOKEN:-}" ] && { echo "no ATTIC_TOKEN; skipping"; exit 0; }
+          nix run nixpkgs#attic-client -- login stubbe https://nix.stubbe.dev "$ATTIC_TOKEN"
+          for attempt in 1 2 3; do
+            if nix run nixpkgs#attic-client -- push default $(cat /tmp/pty-mcp-outpaths); then
+              exit 0
+            fi
+            echo "::warning::attic push attempt $attempt failed; retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          done
+          echo "::warning::attic push failed after 3 attempts; cache push is best-effort, continuing"
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist/
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  bump-tap:
+    name: bump homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip prereleases — only stable tags update the tap formula.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Read sha256 files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p sha
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.sha256' \
+            --dir sha
+          extract() {
+            awk '{print $1}' "sha/pty-mcp-${VERSION}-$1.tar.gz.sha256"
+          }
+          {
+            echo "VERSION=${VERSION}"
+            echo "SHA_DARWIN_ARM64=$(extract aarch64-apple-darwin)"
+            echo "SHA_DARWIN_AMD64=$(extract x86_64-apple-darwin)"
+            echo "SHA_LINUX_ARM64=$(extract aarch64-unknown-linux-musl)"
+            echo "SHA_LINUX_AMD64=$(extract x86_64-unknown-linux-musl)"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: stubbedev/homebrew-pty-mcp
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Regenerate formula
+        run: |
+          set -euo pipefail
+          cat > tap/Formula/pty-mcp.rb <<EOF
+          class PtyMcp < Formula
+            desc "Low-footprint MCP server: interactive PTY sessions + passwordless sudo"
+            homepage "https://github.com/stubbedev/pty-mcp"
+            version "${VERSION}"
+            license "Apache-2.0 OR MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/stubbedev/pty-mcp/releases/download/v#{version}/pty-mcp-#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/stubbedev/pty-mcp/releases/download/v#{version}/pty-mcp-#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/stubbedev/pty-mcp/releases/download/v#{version}/pty-mcp-#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/stubbedev/pty-mcp/releases/download/v#{version}/pty-mcp-#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LINUX_AMD64}"
+              end
+            end
+
+            def install
+              bin.install "pty-mcp"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/pty-mcp --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/pty-mcp.rb; then
+            echo "Formula already up to date for ${VERSION}; nothing to do."
+            exit 0
+          fi
+          git add Formula/pty-mcp.rb
+          git commit -m "pty-mcp ${VERSION}"
+          git push

@@ -1,0 +1,29 @@
+[package]
+name = "pty-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Low-footprint MCP server: persistent interactive PTY sessions + passwordless sudo"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stubbedev/pty-mcp"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+anyhow = "1.0"
+axum = "0.8"
+clap = { version = "4.6.1", features = ["derive"] }
+portable-pty = "0.9.0"
+regex = "1.12.4"
+rmcp = { version = "2.1.0", features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time", "process", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
