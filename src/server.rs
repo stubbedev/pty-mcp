@@ -1,6 +1,7 @@
-//! MCP server: the 9 tools (`pty_*` + `sudo_run`) wired to the session manager.
+//! MCP server: the 9 tools (`run` + `pty_*`) wired to the session manager.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -9,14 +10,24 @@ use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::exec;
 use crate::keys;
 use crate::session::{OpenParams, SessionManager};
-use crate::sudo;
 
 #[derive(Clone)]
 pub struct PtyServer {
     mgr: Arc<SessionManager>,
+    /// Optional `--askpass` override command (baked into the sudo shim).
+    askpass: Option<String>,
+    /// When true, keep sudo's timestamp warm for the whole session after the
+    /// first successful auth.
+    keepalive: bool,
+    keepalive_started: Arc<AtomicBool>,
 }
+
+/// Quiet-period after a write/sendkey before returning the screen. Short so
+/// interactive driving feels responsive; slow output should use `wait_for`.
+const SETTLE_MS: u64 = 40;
 
 fn err(msg: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(msg.into())])
@@ -109,12 +120,11 @@ pub struct SessionArg {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct SudoArgs {
-    /// Command as an argv list, NOT a shell string (e.g. ["apt", "update"]).
-    pub argv: Vec<String>,
-    /// User-facing justification for running this with sudo.
-    pub reason: String,
-    /// Working directory.
+pub struct RunArgs {
+    /// Shell command line, exactly as you'd type it in a terminal (pipes,
+    /// globs, &&, quoting all work). Runs in the user's shell + environment.
+    pub command: String,
+    /// Working directory. Defaults to the user's home.
     #[serde(default)]
     pub cwd: Option<String>,
     /// Timeout in seconds (default 300, max 3600).
@@ -126,8 +136,13 @@ pub struct SudoArgs {
 
 #[tool_router]
 impl PtyServer {
-    pub fn new(mgr: Arc<SessionManager>) -> Self {
-        Self { mgr }
+    pub fn new(mgr: Arc<SessionManager>, askpass: Option<String>, keepalive: bool) -> Self {
+        Self {
+            mgr,
+            askpass,
+            keepalive,
+            keepalive_started: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[tool(
@@ -146,10 +161,13 @@ impl PtyServer {
             scrollback: a.scrollback.unwrap_or(0),
         };
         match self.mgr.open(params) {
-            Ok(s) => Ok(json(serde_json::json!({
-                "session_id": s.id,
-                "shell": s.shell,
-                "cwd": s.cwd,
+            Ok(r) => Ok(json(serde_json::json!({
+                "session_id": r.session.id,
+                "shell": r.session.shell,
+                "cwd": r.session.cwd,
+                // Present only when opening this session evicted the oldest one
+                // to stay under --max-sessions.
+                "evicted_session": r.evicted,
             }))),
             Err(e) => Ok(err(format!("failed to open session: {e}"))),
         }
@@ -188,10 +206,11 @@ impl PtyServer {
                 Err(e) => Ok(err(format!("invalid wait_for regex: {e}"))),
             },
             None => {
-                // Brief settle so the caller sees the immediate echo.
+                // Brief settle so the caller sees the immediate echo, kept
+                // short so interactive driving stays snappy.
                 s.wait(
                     None,
-                    Duration::from_millis(150),
+                    Duration::from_millis(SETTLE_MS),
                     Duration::from_millis(1000),
                 )
                 .await;
@@ -228,7 +247,7 @@ impl PtyServer {
         }
         s.wait(
             None,
-            Duration::from_millis(150),
+            Duration::from_millis(SETTLE_MS),
             Duration::from_millis(1000),
         )
         .await;
@@ -330,22 +349,34 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Run a command with sudo. The password is entered by the user in a native OS dialog — it never passes through this tool, the transport, or your context. Pass the command as an argv list (no shell). Give a clear `reason` shown to the user."
+        description = "Run a one-shot shell command as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell), their home as default cwd. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
     )]
-    async fn sudo_run(
-        &self,
-        Parameters(a): Parameters<SudoArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
+    async fn run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let secs = a.timeout_seconds.unwrap_or(300).min(3600);
-        tracing::info!(reason = %a.reason, argv = ?a.argv, "sudo_run");
-        match sudo::run(&a.argv, a.cwd.as_deref(), Duration::from_secs(secs)).await {
-            Ok(out) => Ok(json(serde_json::json!({
-                "exit_code": out.exit_code,
-                "stdout": out.stdout,
-                "stderr": out.stderr,
-                "timed_out": out.timed_out,
-            }))),
-            Err(e) => Ok(err(format!("sudo failed: {e}"))),
+        tracing::info!(command = %a.command, "run");
+        match exec::run(
+            &a.command,
+            a.cwd.as_deref(),
+            Duration::from_secs(secs),
+            self.askpass.as_deref(),
+        )
+        .await
+        {
+            Ok(out) => {
+                // After a successful sudo command, optionally hold the
+                // timestamp for the rest of the session so later sudo commands
+                // skip the prompt.
+                if self.keepalive && out.used_sudo && !out.timed_out {
+                    exec::spawn_keepalive(Arc::clone(&self.keepalive_started));
+                }
+                Ok(json(serde_json::json!({
+                    "exit_code": out.exit_code,
+                    "stdout": out.stdout,
+                    "stderr": out.stderr,
+                    "timed_out": out.timed_out,
+                })))
+            }
+            Err(e) => Ok(err(format!("run failed: {e}"))),
         }
     }
 }

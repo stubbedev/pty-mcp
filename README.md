@@ -36,8 +36,14 @@ pty-mcp                       # stdio (default) — for Claude Code / editors
 pty-mcp --http 127.0.0.1:8722 # streamable HTTP
 ```
 
-Options: `--idle-timeout <secs>` (default 1800, 0 disables the reaper),
-`--scrollback <lines>` (default 1000).
+Options:
+- `--idle-timeout <secs>` — kill sessions idle longer than this (default 1800, 0 disables).
+- `--scrollback <lines>` — default scrollback per session (default 1000).
+- `--max-sessions <n>` — cap on concurrent sessions; opening past it evicts the oldest (default 50).
+- `--askpass <CMD>` — command used to prompt for the sudo password (see below).
+- `--sudo-keepalive` — after the first sudo auth, keep the credential warm for
+  the whole session so later `sudo` commands skip the prompt. Off by default;
+  grants passwordless root for as long as the server runs.
 
 Register with Claude Code:
 
@@ -49,24 +55,60 @@ claude mcp add pty-mcp -- pty-mcp
 
 | Tool | What it does |
 |------|--------------|
+| `run` | Run a one-shot shell command as the user (their shell, env, cwd); `sudo` auto-uses the dialog. |
 | `pty_open` | Start a session (shell/cwd/size/env), returns a `session_id`. |
 | `pty_write` | Write text to the PTY; optionally wait for a regex; returns the screen. |
 | `pty_sendkey` | Send named keys: `enter`, arrows, `f1`–`f12`, `ctrl+<letter>`, … |
-| `pty_read` | Rendered screen + cursor + alt-screen flag + exit status. |
+| `pty_read` | Rendered screen + cursor + alt-screen flag + real exit code. |
 | `pty_wait` | Block until a regex matches, or until output goes quiet. |
 | `pty_resize` | Resize the terminal (SIGWINCH). |
 | `pty_close` | Terminate a session. |
 | `pty_list` | List active sessions with age/idle. |
-| `sudo_run` | Run an argv (no shell) under `sudo`; password via OS dialog. |
 
-## How `sudo_run` keeps the password out of context
+Use `run` for one-shot commands ("build the project", "install a package"), and
+`pty_open` + friends when you need to *drive* something interactive (a REPL,
+`vim`, `ssh`, a prompt).
 
-`sudo_run` runs `sudo -A` with `SUDO_ASKPASS` pointed at this binary's hidden
-`askpass` subcommand. When sudo needs a password it launches that helper, which
-pops a native dialog (`osascript` on macOS; `zenity`/`kdialog` on Linux). The
-password flows dialog → helper → sudo. It is never sent over the MCP transport,
-never stored, and never enters the model's context. The command is passed as an
-argv list and executed without a shell, so there is no shell-injection surface.
+## Runs as the user
+
+`run` and every PTY session execute in the user's **own shell and environment**:
+`PATH` matches their interactive shell (nix, cargo, custom bins), `HOME` is the
+default cwd. The environment is captured once at startup by sourcing the user's
+login+interactive shell, so it's correct even when pty-mcp runs over HTTP, from
+a proxy, or under systemd where the process's own env is stripped.
+
+## How `sudo` keeps the password out of context
+
+Any `sudo` in a `run` command or a PTY session transparently uses an OS password
+dialog — never the transport or the model's context. A `sudo` wrapper is
+prepended to `PATH` that adds `-A` (askpass) for real command execution while
+leaving management flags (`-k`/`-v`/`-l`) alone, with `SUDO_ASKPASS` pointing at
+this binary's hidden `askpass` subcommand. When sudo needs a password the helper
+prompts and prints it straight to sudo. It is never sent over the transport,
+stored, or shown to the model. (`--sudo-keepalive` keeps one entry valid for the
+whole session.)
+
+### Choosing the prompt
+
+With no `--askpass`, the helper autodetects an ssh-askpass-style program
+(`ksshaskpass`, `ssh-askpass`, …), then `kdialog`, then `zenity` (last resort).
+
+For a nicer prompt, pass any launcher that prints the typed password to stdout —
+the prompt text is available to it as `$PTY_MCP_PROMPT`:
+
+```sh
+# gtk-layer-shell (no Qt):
+pty-mcp --askpass 'wofi --dmenu --password --prompt sudo </dev/null'
+# layer-shell:
+pty-mcp --askpass 'fuzzel --dmenu --password --prompt "sudo: "'
+# rofi:
+pty-mcp --askpass 'rofi -dmenu -password -p sudo'
+```
+
+Note: there is no xdg-desktop-portal interface for prompting a password (the
+`Secret` portal fetches an app's stored keyring secret; it does not prompt), so
+a portal-based prompt isn't possible — use a layer-shell launcher via
+`--askpass` instead.
 
 ## Development
 

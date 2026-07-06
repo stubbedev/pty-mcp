@@ -8,10 +8,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::Notify;
 
 use crate::screen::Emulator;
+use crate::{askpass, userenv};
+
+/// Scrollback window `pty_wait`/`wait_for` matches against, so output that
+/// scrolled off the visible screen between wakeups is still seen.
+const WAIT_WINDOW: usize = 400;
 
 /// Shared, thread-crossing state: the reader thread writes it, async tool
 /// handlers read it.
@@ -31,7 +36,7 @@ pub struct Session {
     pub created: Instant,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     shared: Arc<Shared>,
 }
 
@@ -54,7 +59,7 @@ pub struct Snapshot {
 }
 
 impl Session {
-    fn spawn(id: String, p: &OpenParams) -> Result<Arc<Session>> {
+    fn spawn(id: String, p: &OpenParams, askpass_cmd: Option<&str>) -> Result<Arc<Session>> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -65,21 +70,27 @@ impl Session {
             })
             .context("openpty")?;
 
-        let shell = p
-            .shell
-            .clone()
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/sh".to_string());
+        let shell = p.shell.clone().unwrap_or_else(userenv::shell);
         let mut cmd = CommandBuilder::new(&shell);
-        if let Some(cwd) = &p.cwd {
-            cmd.cwd(cwd);
+
+        // Run in the user's real environment (PATH as their interactive shell
+        // has it), then layer on the sudo helpers so `sudo` inside the session
+        // pops the OS dialog, then TERM, then caller overrides.
+        cmd.env_clear();
+        let base_path = userenv::user_env().get("PATH").cloned().unwrap_or_default();
+        for (k, v) in userenv::user_env() {
+            cmd.env(k, v);
         }
-        // A sane default TERM so programs emit the escape sequences the
-        // emulator understands.
+        for (k, v) in askpass::apply_to_env(&base_path, askpass_cmd) {
+            cmd.env(k, v);
+        }
         cmd.env("TERM", "xterm-256color");
         for (k, v) in &p.env {
             cmd.env(k, v);
         }
+
+        let cwd = p.cwd.clone().unwrap_or_else(userenv::home);
+        cmd.cwd(&cwd);
 
         let child = pair
             .slave
@@ -90,16 +101,7 @@ impl Session {
 
         let writer = pair.master.take_writer().context("take pty writer")?;
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
-
-        let cwd = p
-            .cwd
-            .clone()
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|d| d.display().to_string())
-            })
-            .unwrap_or_default();
+        let killer = child.clone_killer();
 
         let shared = Arc::new(Shared {
             emu: Mutex::new(Emulator::new(p.cols, p.rows, p.scrollback)),
@@ -109,6 +111,7 @@ impl Session {
         });
 
         spawn_reader(reader, Arc::clone(&shared));
+        spawn_waiter(child, Arc::clone(&shared));
 
         Ok(Arc::new(Session {
             id,
@@ -117,7 +120,7 @@ impl Session {
             created: Instant::now(),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
-            child: Mutex::new(child),
+            killer: Mutex::new(killer),
             shared,
         }))
     }
@@ -181,7 +184,7 @@ impl Session {
             let notified = self.shared.notify.notified();
 
             if let Some(re) = pattern {
-                if re.is_match(&self.shared.emu.lock().unwrap().visible_text()) {
+                if re.is_match(&self.shared.emu.lock().unwrap().render(WAIT_WINDOW)) {
                     return true;
                 }
             } else if self.idle() >= quiet {
@@ -207,8 +210,8 @@ impl Session {
     }
 
     fn kill(&self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
+        if let Ok(mut k) = self.killer.lock() {
+            let _ = k.kill();
         }
     }
 }
@@ -227,7 +230,8 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    *shared.exited.lock().unwrap() = Some(0);
+                    // EOF: the child is gone. The waiter thread records the real
+                    // exit code; here we just wake anyone blocked on output.
                     shared.notify.notify_waiters();
                     break;
                 }
@@ -241,36 +245,73 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
     });
 }
 
+/// Reap the child to record its real exit status (the reader thread only sees
+/// EOF, not the code). One blocking std thread per session, parked in `wait`.
+fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, shared: Arc<Shared>) {
+    std::thread::spawn(move || {
+        let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+        *shared.exited.lock().unwrap() = Some(code);
+        shared.notify.notify_waiters();
+    });
+}
+
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     counter: AtomicU64,
     idle_timeout: Duration,
     default_scrollback: usize,
+    max_sessions: usize,
+    askpass: Option<String>,
+}
+
+/// Result of opening a session: the new session, plus the id of any session
+/// evicted to stay under the cap (reported back to the caller).
+pub struct OpenResult {
+    pub session: Arc<Session>,
+    pub evicted: Option<String>,
 }
 
 impl SessionManager {
-    pub fn new(idle_timeout: Duration, default_scrollback: usize) -> Arc<Self> {
+    pub fn new(
+        idle_timeout: Duration,
+        default_scrollback: usize,
+        max_sessions: usize,
+        askpass: Option<String>,
+    ) -> Arc<Self> {
         let mgr = Arc::new(SessionManager {
             sessions: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             idle_timeout,
             default_scrollback,
+            max_sessions: max_sessions.max(1),
+            askpass,
         });
         mgr.clone().spawn_reaper();
         mgr
     }
 
-    pub fn open(&self, mut p: OpenParams) -> Result<Arc<Session>> {
+    pub fn open(&self, mut p: OpenParams) -> Result<OpenResult> {
         if p.scrollback == 0 {
             p.scrollback = self.default_scrollback;
         }
         let id = format!("pty-{}", self.counter.fetch_add(1, Ordering::Relaxed));
-        let session = Session::spawn(id.clone(), &p)?;
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(id, Arc::clone(&session));
-        Ok(session)
+        let session = Session::spawn(id.clone(), &p, self.askpass.as_deref())?;
+
+        let mut sessions = self.sessions.lock().unwrap();
+        // Enforce the cap by evicting the oldest session (dropping it kills the
+        // child). Done before insert so the count stays bounded.
+        let mut evicted = None;
+        if sessions.len() >= self.max_sessions
+            && let Some(oldest) = sessions
+                .values()
+                .min_by_key(|s| s.created)
+                .map(|s| s.id.clone())
+        {
+            sessions.remove(&oldest);
+            evicted = Some(oldest);
+        }
+        sessions.insert(id, Arc::clone(&session));
+        Ok(OpenResult { session, evicted })
     }
 
     pub fn get(&self, id: &str) -> Result<Arc<Session>> {
@@ -340,10 +381,13 @@ mod tests {
         }
     }
 
+    fn mgr() -> Arc<SessionManager> {
+        SessionManager::new(Duration::from_secs(600), 1000, 50, None)
+    }
+
     #[tokio::test]
     async fn echo_roundtrip() {
-        let mgr = SessionManager::new(Duration::from_secs(600), 1000);
-        let s = mgr.open(params()).unwrap();
+        let s = mgr().open(params()).unwrap().session;
         s.write(b"printf hello\r\n").unwrap();
         let re = regex::Regex::new("hello").unwrap();
         assert!(
@@ -356,8 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_detected() {
-        let mgr = SessionManager::new(Duration::from_secs(600), 1000);
-        let s = mgr.open(params()).unwrap();
+        let s = mgr().open(params()).unwrap().session;
         s.write(b"exit\r\n").unwrap();
         // wait() returns true on exit regardless of pattern.
         let re = regex::Regex::new("this-will-never-match").unwrap();
@@ -369,9 +412,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_exit_code_captured() {
+        let s = mgr().open(params()).unwrap().session;
+        s.write(b"exit 7\r\n").unwrap();
+        let re = regex::Regex::new("nope").unwrap();
+        s.wait(Some(&re), Duration::ZERO, Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            s.snapshot(0).exited,
+            Some(7),
+            "should capture real exit code"
+        );
+    }
+
+    #[tokio::test]
+    async fn evicts_oldest_at_cap() {
+        let m = SessionManager::new(Duration::from_secs(600), 1000, 2, None);
+        let a = m.open(params()).unwrap();
+        assert!(a.evicted.is_none());
+        let _b = m.open(params()).unwrap();
+        let c = m.open(params()).unwrap(); // over cap of 2
+        assert_eq!(c.evicted.as_deref(), Some(a.session.id.as_str()));
+        assert_eq!(m.list().len(), 2);
+    }
+
+    #[tokio::test]
     async fn quiet_settle() {
-        let mgr = SessionManager::new(Duration::from_secs(600), 1000);
-        let s = mgr.open(params()).unwrap();
+        let s = mgr().open(params()).unwrap().session;
         s.write(b"printf ready\r\n").unwrap();
         assert!(
             s.wait(None, Duration::from_millis(200), Duration::from_secs(5))
@@ -382,11 +449,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_and_close() {
-        let mgr = SessionManager::new(Duration::from_secs(600), 1000);
-        let s = mgr.open(params()).unwrap();
-        assert_eq!(mgr.list().len(), 1);
-        mgr.close(&s.id).unwrap();
-        assert_eq!(mgr.list().len(), 0);
-        assert!(mgr.get(&s.id).is_err());
+        let m = mgr();
+        let s = m.open(params()).unwrap().session;
+        assert_eq!(m.list().len(), 1);
+        m.close(&s.id).unwrap();
+        assert_eq!(m.list().len(), 0);
+        assert!(m.get(&s.id).is_err());
     }
 }

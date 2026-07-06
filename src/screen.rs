@@ -124,12 +124,6 @@ impl Emulator {
         }
         out
     }
-
-    /// Cheap signature of the current visible screen, used by `pty_wait` to
-    /// detect "screen settled" and by callers matching output.
-    pub fn visible_text(&self) -> String {
-        self.render(0)
-    }
 }
 
 #[cfg(test)]
@@ -140,14 +134,14 @@ mod tests {
     fn renders_plain_text() {
         let mut e = Emulator::new(20, 5, 100);
         e.advance(b"hello");
-        assert_eq!(e.visible_text(), "hello");
+        assert_eq!(e.render(0), "hello");
     }
 
     #[test]
     fn handles_newlines_and_cr() {
         let mut e = Emulator::new(20, 5, 100);
         e.advance(b"line1\r\nline2");
-        assert_eq!(e.visible_text(), "line1\nline2");
+        assert_eq!(e.render(0), "line1\nline2");
     }
 
     #[test]
@@ -175,7 +169,7 @@ mod tests {
         let mut e = Emulator::new(40, 10, 100);
         e.advance(b"one\r\ntwo\r\n");
         // Only two non-empty lines despite a 10-row grid.
-        assert_eq!(e.visible_text(), "one\ntwo");
+        assert_eq!(e.render(0), "one\ntwo");
     }
 
     #[test]

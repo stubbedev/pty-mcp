@@ -2,11 +2,12 @@
 //! passwordless sudo. stdio by default; `--http <addr>` for streamable HTTP.
 
 mod askpass;
+mod exec;
 mod keys;
 mod screen;
 mod server;
 mod session;
-mod sudo;
+mod userenv;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,24 @@ struct Cli {
     /// Default scrollback lines per session.
     #[arg(long, default_value_t = 1000)]
     scrollback: usize,
+
+    /// Max concurrent PTY sessions; opening past this evicts the oldest.
+    #[arg(long, default_value_t = 50)]
+    max_sessions: usize,
+
+    /// Command used to prompt for the sudo password (password read from its
+    /// stdout, prompt text in $PTY_MCP_PROMPT). Point it at any launcher, e.g.
+    /// 'wofi --dmenu --password --prompt sudo </dev/null' or
+    /// 'rofi -dmenu -password -p sudo'. Default: autodetect ssh-askpass/kdialog/zenity.
+    #[arg(long, value_name = "CMD")]
+    askpass: Option<String>,
+
+    /// After the first successful sudo auth, keep sudo's credential timestamp
+    /// warm for the whole session (one password entry covers all later
+    /// sudo_run calls). Off by default: this grants passwordless root for as
+    /// long as the server runs.
+    #[arg(long)]
+    sudo_keepalive: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -68,24 +87,46 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mgr = SessionManager::new(Duration::from_secs(cli.idle_timeout), cli.scrollback);
+    // Capture the user's shell environment once, up front, so PATH/HOME are
+    // correct for every run/session even when launched over HTTP or a proxy.
+    let _ = userenv::user_env();
+
+    let askpass = cli.askpass;
+    let keepalive = cli.sudo_keepalive;
+    let mgr = SessionManager::new(
+        Duration::from_secs(cli.idle_timeout),
+        cli.scrollback,
+        cli.max_sessions,
+        askpass.clone(),
+    );
 
     match cli.http {
-        Some(addr) => serve_http(mgr, &addr).await,
-        None => serve_stdio(mgr).await,
+        Some(addr) => serve_http(mgr, askpass, keepalive, &addr).await,
+        None => serve_stdio(mgr, askpass, keepalive).await,
     }
 }
 
-async fn serve_stdio(mgr: Arc<SessionManager>) -> Result<()> {
+async fn serve_stdio(
+    mgr: Arc<SessionManager>,
+    askpass: Option<String>,
+    keepalive: bool,
+) -> Result<()> {
     tracing::info!("pty-mcp serving on stdio");
-    let service = PtyServer::new(mgr).serve(stdio()).await?;
+    let service = PtyServer::new(mgr, askpass, keepalive)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }
 
-async fn serve_http(mgr: Arc<SessionManager>, addr: &str) -> Result<()> {
+async fn serve_http(
+    mgr: Arc<SessionManager>,
+    askpass: Option<String>,
+    keepalive: bool,
+    addr: &str,
+) -> Result<()> {
     let service = StreamableHttpService::new(
-        move || Ok(PtyServer::new(Arc::clone(&mgr))),
+        move || Ok(PtyServer::new(Arc::clone(&mgr), askpass.clone(), keepalive)),
         Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
