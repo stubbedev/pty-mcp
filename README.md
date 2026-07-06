@@ -1,21 +1,18 @@
 # pty-mcp
 
-A low-footprint [MCP](https://modelcontextprotocol.io) server that gives an AI
-agent two things:
+A low-footprint [MCP](https://modelcontextprotocol.io) server that lets an AI
+agent use a real terminal:
 
-1. **Persistent interactive PTY sessions** — a real pseudo-terminal with full
-   VT/xterm emulation, so the agent can drive REPLs, `ssh`, `vim`, `htop`,
-   password prompts, and anything else that needs a live terminal instead of
-   one-shot `bash` calls.
-2. **Passwordless `sudo`** — run privileged commands where the password is
-   entered by the *user* in a native OS dialog and never touches the MCP
-   transport or the model's context.
+- **`run`** a shell command exactly as the user would — their shell, full
+  environment, and cwd.
+- **`pty_*`** drive a persistent pseudo-terminal with full VT/xterm emulation,
+  for anything interactive: REPLs, `ssh`, `vim`, `htop`, prompts.
+- **`sudo`** works transparently — the password is typed by the user into a
+  native OS dialog and never touches the MCP transport or the model's context.
 
-It replaces [ptyai](https://github.com/xdrr/ptyai) (Node) and
-[sudo-mcp](https://github.com/0xMH/sudo-mcp) with a single static Rust binary.
-Idle RSS is ~5 MB (vs. ~50–100 MB for a Node runtime); terminal emulation is
-handled by [`alacritty_terminal`](https://crates.io/crates/alacritty_terminal),
-the same engine Alacritty ships.
+A single static Rust binary, ~5 MB idle RSS. Terminal emulation uses
+[`alacritty_terminal`](https://crates.io/crates/alacritty_terminal), the same
+engine Alacritty ships.
 
 Linux and macOS. No Windows/ConPTY yet.
 
@@ -71,44 +68,29 @@ Use `run` for one-shot commands ("build the project", "install a package"), and
 
 ## Runs as the user
 
-`run` and every PTY session execute in the user's **own shell and environment**:
+`run` and every PTY session execute in the user's own shell and environment:
 `PATH` matches their interactive shell (nix, cargo, custom bins), `HOME` is the
-default cwd. The environment is captured once at startup by sourcing the user's
-login+interactive shell, so it's correct even when pty-mcp runs over HTTP, from
-a proxy, or under systemd where the process's own env is stripped.
+default cwd. The environment is captured once at startup by sourcing the login
+shell, so it's correct even when pty-mcp runs over HTTP, behind a proxy, or under
+systemd — where the process's own environment would otherwise be stripped.
 
-## How `sudo` keeps the password out of context
+## Sudo
 
-Any `sudo` in a `run` command or a PTY session transparently uses an OS password
-dialog — never the transport or the model's context. A `sudo` wrapper is
-prepended to `PATH` that adds `-A` (askpass) for real command execution while
-leaving management flags (`-k`/`-v`/`-l`) alone, with `SUDO_ASKPASS` pointing at
-this binary's hidden `askpass` subcommand. When sudo needs a password the helper
-prompts and prints it straight to sudo. It is never sent over the transport,
-stored, or shown to the model. (`--sudo-keepalive` keeps one entry valid for the
-whole session.)
+`sudo` in any command or session prompts the user through a native OS dialog; the
+password goes straight to sudo and is never sent over the transport, stored, or
+shown to the model. `--sudo-keepalive` keeps one entry valid for the session.
 
-### Choosing the prompt
-
-With no `--askpass`, the helper autodetects an ssh-askpass-style program
-(`ksshaskpass`, `ssh-askpass`, …), then `kdialog`, then `zenity` (last resort).
-
-For a nicer prompt, pass any launcher that prints the typed password to stdout —
-the prompt text is available to it as `$PTY_MCP_PROMPT`:
+The prompt is pluggable via `--askpass <CMD>` — any launcher that prints the
+password to stdout (prompt text is in `$PTY_MCP_PROMPT`):
 
 ```sh
-# gtk-layer-shell (no Qt):
 pty-mcp --askpass 'wofi --dmenu --password --prompt sudo </dev/null'
-# layer-shell:
 pty-mcp --askpass 'fuzzel --dmenu --password --prompt "sudo: "'
-# rofi:
 pty-mcp --askpass 'rofi -dmenu -password -p sudo'
 ```
 
-Note: there is no xdg-desktop-portal interface for prompting a password (the
-`Secret` portal fetches an app's stored keyring secret; it does not prompt), so
-a portal-based prompt isn't possible — use a layer-shell launcher via
-`--askpass` instead.
+Without `--askpass`, it autodetects an ssh-askpass-style helper (`ksshaskpass`,
+`ssh-askpass`, …), then `kdialog`, then `zenity`.
 
 ## Development
 
