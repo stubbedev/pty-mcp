@@ -175,9 +175,14 @@ mod tests {
 
     #[tokio::test]
     async fn cwd_override() {
-        let out = run("pwd", Some("/tmp"), Duration::from_secs(10), None)
+        // Use the OS temp dir and compare canonical paths — macOS resolves
+        // /tmp to /private/tmp, so a literal string compare is wrong there.
+        let dir = std::env::temp_dir();
+        let out = run("pwd", dir.to_str(), Duration::from_secs(10), None)
             .await
             .unwrap();
-        assert_eq!(out.stdout.trim().trim_end_matches('/'), "/tmp");
+        let got = std::fs::canonicalize(out.stdout.trim()).unwrap();
+        let want = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(got, want);
     }
 }
