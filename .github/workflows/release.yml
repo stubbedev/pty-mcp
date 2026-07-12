@@ -25,7 +25,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -64,7 +64,7 @@ jobs:
     name: push nix build to xilo
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v22
       - uses: nix-community/cache-nix-action@v7
         with:
@@ -93,7 +93,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -136,7 +136,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Check out homebrew tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: stubbedev/homebrew-pty-mcp
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
