@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "pty-mcp"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

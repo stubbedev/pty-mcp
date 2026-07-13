@@ -1,6 +1,6 @@
 [package]
 name = "pty-mcp"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Low-footprint MCP server: persistent interactive PTY sessions + passwordless sudo"
 license = "MIT OR Apache-2.0"
