@@ -3,12 +3,14 @@
 
 mod askpass;
 mod exec;
+mod hook;
 mod keys;
 mod screen;
 mod server;
 mod session;
 mod userenv;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +50,12 @@ struct Cli {
     #[arg(long, value_name = "CMD")]
     askpass: Option<String>,
 
+    /// On startup, install the Claude Code PreToolUse hook into
+    /// ~/.claude/settings.json if it's missing, so Bash calls route through this
+    /// server. Takes effect the next session (Claude loads hooks at startup).
+    #[arg(long)]
+    install_hook: bool,
+
     /// After the first successful sudo auth, keep sudo's credential timestamp
     /// warm for the whole session (one password entry covers all later
     /// sudo_run calls). Off by default: this grants passwordless root for as
@@ -67,15 +75,44 @@ enum Command {
         #[arg(default_value = "Password:")]
         prompt: String,
     },
+
+    /// Internal: Claude Code PreToolUse hook. Reads the event on stdin and
+    /// redirects Bash calls to the `run` tool. Wired up by `pty-mcp install`.
+    #[command(hide = true)]
+    Hook,
+
+    /// Install the Claude Code hook that routes shell commands through pty-mcp
+    /// (instead of the built-in Bash tool), so this server actually gets used.
+    Install {
+        /// Target a project's .claude/settings.json instead of global ~/.claude.
+        #[arg(long, value_name = "DIR")]
+        project: Option<PathBuf>,
+
+        /// Print the resulting settings.json without writing it.
+        #[arg(long)]
+        print: bool,
+
+        /// Remove the hook instead of adding it.
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // askpass mode short-circuits before any logging/server setup.
-    if let Some(Command::Askpass { prompt }) = &cli.command {
-        askpass::run(prompt);
+    // These subcommands short-circuit before any logging/server/env setup.
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            Command::Askpass { prompt } => askpass::run(prompt),
+            Command::Hook => hook::run_hook(),
+            Command::Install {
+                project,
+                print,
+                uninstall,
+            } => return hook::install(project.clone(), *print, *uninstall),
+        }
     }
 
     // Logs go to stderr so they never corrupt the stdio JSON-RPC stream.
@@ -86,6 +123,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "pty_mcp=info,rmcp=warn".into()),
         )
         .init();
+
+    if cli.install_hook {
+        hook::install_on_spawn();
+    }
 
     // Capture the user's shell environment once, up front, so PATH/HOME are
     // correct for every run/session even when launched over HTTP or a proxy.

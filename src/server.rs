@@ -349,7 +349,7 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Run a one-shot shell command as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell), their home as default cwd. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
+        description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), their home as default cwd (pass `cwd` for a project dir). Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
     )]
     async fn run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let secs = a.timeout_seconds.unwrap_or(300).min(3600);
@@ -387,9 +387,11 @@ impl ServerHandler for PtyServer {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Interactive PTY sessions + passwordless sudo. Open a session with pty_open, \
-             drive it with pty_write/pty_sendkey, observe with pty_read/pty_wait. Use sudo_run \
-             for privileged commands (password prompted via OS dialog)."
+            "Preferred shell for this session. Use `run` for one-shot commands (build, test, \
+             install, git) — it runs in the user's full login-shell environment; prefix with \
+             sudo for privileged commands (password prompted via OS dialog, never in context). \
+             For interactive programs open a session with pty_open, drive it with \
+             pty_write/pty_sendkey, and observe with pty_read/pty_wait."
                 .into(),
         );
         info.server_info.name = "pty-mcp".into();

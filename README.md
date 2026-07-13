@@ -34,6 +34,7 @@ pty-mcp --http 127.0.0.1:8722 # streamable HTTP
 ```
 
 Options:
+- `--install-hook` — on startup, install the Claude Code hook (if missing) so Bash calls route through this server; takes effect the next session.
 - `--idle-timeout <secs>` — kill sessions idle longer than this (default 1800, 0 disables).
 - `--scrollback <lines>` — default scrollback per session (default 1000).
 - `--max-sessions <n>` — cap on concurrent sessions; opening past it evicts the oldest (default 50).
@@ -45,8 +46,50 @@ Options:
 Register with Claude Code:
 
 ```sh
-claude mcp add pty-mcp -- pty-mcp
+claude mcp add pty-mcp -- pty-mcp     # register the MCP server
+pty-mcp install                       # route shell commands through it
 ```
+
+`pty-mcp install` detects which agent harnesses are installed on the machine (by their
+config file) and wires a shell-redirect hook into each. Without it, the agent keeps
+reaching for its built-in Bash tool and this server never gets used; the hook redirects
+each Bash call to the `run` tool so commands run in your real login-shell environment
+and `sudo` uses the OS dialog.
+
+Detected harnesses (by their config dir) and where the hook lands:
+
+| Harness | Detect | Config written | Mechanism |
+|---------|--------|----------------|-----------|
+| Claude Code | `~/.claude` | `~/.claude/settings.json` | `PreToolUse` command hook |
+| Codex | `~/.codex` | `~/.codex/hooks.json` | `PreToolUse` command hook |
+| Gemini CLI | `~/.gemini` | `~/.gemini/settings.json` | `BeforeTool` command hook |
+| opencode | `~/.config/opencode` | `~/.config/opencode/plugins/pty-mcp.js` | `tool.execute.before` plugin |
+
+One `pty-mcp hook` binary serves the command-hook harnesses (it emits each one's
+deny format based on the event it receives); opencode gets a tiny generated plugin
+that shells out to the same binary.
+
+```sh
+pty-mcp install --project .    # Claude Code, this repo only
+pty-mcp install --print        # preview the config, write nothing
+pty-mcp install --uninstall    # remove the hook from every detected harness
+```
+
+Or let the server install its own hook — register it once with `--install-hook`:
+
+```sh
+claude mcp add pty-mcp -- pty-mcp --install-hook
+```
+
+On each startup it adds the hook if missing (idempotent). The hook takes effect the
+*next* session — Claude Code loads hooks at startup and won't hot-apply one written
+mid-session — so the first run bootstraps and every run after is active.
+
+The hook fails open: if pty-mcp is no longer registered as an MCP server, it noops and
+lets Bash through rather than stranding commands with a redirect to a missing tool.
+
+Escape hatches (the hook lets these through to built-in Bash): append ` #bash` to a
+command, or set `run_in_background`.
 
 ## Tools
 
