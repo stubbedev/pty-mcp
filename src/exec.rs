@@ -2,7 +2,7 @@
 //!
 //! The command runs via `$SHELL -c` with the user's full captured environment
 //! (so `PATH` matches their interactive shell — nix, cargo, … — even over HTTP
-//! or a proxy) and their home as the default cwd. `sudo` anywhere in the
+//! or a proxy) and the harness's cwd as the default. `sudo` anywhere in the
 //! command transparently uses the OS password dialog via the PATH-injected
 //! wrapper (see [`crate::askpass`]); the password never reaches the model.
 
@@ -47,7 +47,7 @@ pub async fn run(
     for (k, v) in askpass::apply_to_env(&base_path, askpass_cmd) {
         cmd.env(k, v);
     }
-    cmd.current_dir(cwd.map(str::to_string).unwrap_or_else(userenv::home));
+    cmd.current_dir(cwd.map(str::to_string).unwrap_or_else(userenv::harness_cwd));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -65,7 +65,7 @@ pub async fn run(
 
     let mut child = cmd.spawn().context("spawn shell")?;
     let pid = child.id();
-    let used_sudo = command.split_whitespace().any(|t| t == "sudo");
+    let used_sudo = mentions_sudo(command);
 
     // Stream both pipes concurrently, keeping at most MAX_STREAM and draining
     // the rest, so a huge-output command can neither blow up memory (the old
@@ -105,6 +105,16 @@ pub async fn run(
         timed_out,
         used_sudo,
     })
+}
+
+/// Does the command line invoke sudo? Split on whitespace AND shell operators,
+/// so `foo|sudo tee x` or `a;sudo b` count too. False positives (e.g. `echo
+/// sudo`) are harmless — the keepalive refresher just finds no timestamp and
+/// stops.
+fn mentions_sudo(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || "|;&()<>".contains(c))
+        .any(|t| t == "sudo")
 }
 
 /// Exit code, mapping death-by-signal to the shell convention `128 + signal`.
@@ -181,6 +191,16 @@ mod tests {
     #[test]
     fn cap_under_limit_passthrough() {
         assert_eq!(cap(b"hello"), "hello");
+    }
+
+    #[test]
+    fn sudo_detected_through_shell_operators() {
+        assert!(mentions_sudo("sudo apt update"));
+        assert!(mentions_sudo("echo hi|sudo tee /etc/x"));
+        assert!(mentions_sudo("a && sudo b"));
+        assert!(mentions_sudo("true;sudo reboot"));
+        assert!(!mentions_sudo("echo sudoku"));
+        assert!(!mentions_sudo("visudo"));
     }
 
     #[test]

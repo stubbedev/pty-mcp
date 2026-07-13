@@ -28,6 +28,17 @@ pub fn home() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+/// The harness's working directory: MCP clients launch stdio servers in their
+/// own cwd (the project dir), so the process cwd is the right session default.
+/// Falls back to home when it's unusable — e.g. `/` under systemd or HTTP.
+pub fn harness_cwd() -> String {
+    std::env::current_dir()
+        .ok()
+        .filter(|p| p != std::path::Path::new("/"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(home)
+}
+
 /// Run the login+interactive shell and dump its environment. Falls back to the
 /// inherited environment if the shell can't be run or times out (e.g. an rc
 /// file that blocks). `-l -i` so both profile and rc (where PATH usually lives)

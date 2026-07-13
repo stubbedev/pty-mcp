@@ -135,9 +135,11 @@ fn file_mentions(path: &std::path::Path, needle: &str) -> bool {
 
 /// A trailing `#bash` comment (e.g. `ls -la #bash`) opts this call out of the
 /// redirect. Bash ignores the comment, so the command still runs unchanged.
+/// Anchored to the end so a command merely *mentioning* it (`grep '#bash'`)
+/// doesn't silently opt out.
 fn has_bash_optout(command: &str) -> bool {
-    let c = command.to_ascii_lowercase();
-    c.contains("#bash") || c.contains("# bash")
+    let c = command.trim_end().to_ascii_lowercase();
+    c.ends_with("#bash") || c.ends_with("# bash")
 }
 
 fn redirect_reason(command: &str, cwd: &str) -> String {
@@ -544,6 +546,14 @@ mod tests {
     #[test]
     fn allows_optout() {
         assert!(reason("ls -la #bash").is_none());
+        assert!(reason("ls -la # bash  ").is_none());
+    }
+
+    #[test]
+    fn optout_must_be_trailing() {
+        // Merely mentioning #bash mid-command is not an opt-out.
+        assert!(reason("grep '#bash' src/hook.rs").is_some());
+        assert!(reason("echo '#bash' > note.txt").is_some());
     }
 
     #[test]

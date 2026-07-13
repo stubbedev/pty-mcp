@@ -56,6 +56,9 @@ pub fn apply_to_env(base_path: &str, askpass_override: Option<&str>) -> Vec<(Str
 
 fn install(askpass_override: Option<&str>) -> Result<Helpers> {
     let exe = std::env::current_exe().context("resolve current exe")?;
+    // The dir is per-pid and can't be removed on our own exit (kill -9), so
+    // sweep predecessors' leftovers now instead.
+    clean_stale(&std::env::temp_dir());
     // A private per-process dir; creating it 0700 keeps a local attacker from
     // pre-planting symlinks the shims would follow.
     let dir = std::env::temp_dir().join(format!("pty-mcp-{}", std::process::id()));
@@ -88,6 +91,33 @@ fn install(askpass_override: Option<&str>) -> Result<Helpers> {
         path_dir: dir,
         askpass,
     })
+}
+
+/// Remove `pty-mcp-<pid>` helper dirs left by processes that no longer exist.
+/// Best-effort: other users' dirs fail to remove and are skipped silently.
+fn clean_stale(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("pty-mcp-"))
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        // Signal 0 probes liveness: ESRCH → the owning process is gone.
+        let dead = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn write_exec(path: &Path, body: &str) -> Result<()> {
@@ -289,6 +319,25 @@ mod tests {
             run_command("printf %s \"$PTY_MCP_PROMPT\"", "sudo pw"),
             Some("sudo pw".into())
         );
+    }
+
+    #[test]
+    fn clean_stale_removes_dead_pid_dirs_only() {
+        let tmp = std::env::temp_dir().join("pty-mcp-clean-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A dir whose pid can't be alive (> pid_max on default Linux).
+        let dead = tmp.join("pty-mcp-4999999");
+        // Our own pid → must survive. Plus a non-matching name.
+        let ours = tmp.join(format!("pty-mcp-{}", std::process::id()));
+        let other = tmp.join("unrelated");
+        for d in [&dead, &ours, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        clean_stale(&tmp);
+        assert!(!dead.exists(), "dead-pid dir removed");
+        assert!(ours.exists(), "own dir kept");
+        assert!(other.exists(), "non-matching dir untouched");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

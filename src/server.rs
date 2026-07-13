@@ -48,7 +48,8 @@ pub struct OpenArgs {
     /// Shell/program to run. Defaults to $SHELL, else /bin/sh.
     #[serde(default)]
     pub shell: Option<String>,
-    /// Working directory. Defaults to the user's home.
+    /// Working directory. Defaults to the harness's working directory (the
+    /// project the agent is working in).
     #[serde(default)]
     pub cwd: Option<String>,
     /// Terminal columns (default 120).
@@ -124,7 +125,8 @@ pub struct RunArgs {
     /// Shell command line, exactly as you'd type it in a terminal (pipes,
     /// globs, &&, quoting all work). Runs in the user's shell + environment.
     pub command: String,
-    /// Working directory. Defaults to the user's home.
+    /// Working directory. Defaults to the harness's working directory (the
+    /// project the agent is working in).
     #[serde(default)]
     pub cwd: Option<String>,
     /// Timeout in seconds (default 300, max 3600).
@@ -349,7 +351,7 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), their home as default cwd (pass `cwd` for a project dir). Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
+        description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), defaulting to the project directory you're working in. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
     )]
     async fn run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let secs = a.timeout_seconds.unwrap_or(300).min(3600);

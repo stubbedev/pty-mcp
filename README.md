@@ -112,8 +112,9 @@ Use `run` for one-shot commands ("build the project", "install a package"), and
 ## Runs as the user
 
 `run` and every PTY session execute in the user's own shell and environment:
-`PATH` matches their interactive shell (nix, cargo, custom bins), `HOME` is the
-default cwd. The environment is captured once at startup by sourcing the login
+`PATH` matches their interactive shell (nix, cargo, custom bins), and the
+default cwd is the harness's working directory — the project the agent is in
+(home when that's unavailable). The environment is captured once at startup by sourcing the login
 shell, so it's correct even when pty-mcp runs over HTTP, behind a proxy, or under
 systemd — where the process's own environment would otherwise be stripped.
 

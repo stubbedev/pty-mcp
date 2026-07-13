@@ -89,7 +89,7 @@ impl Session {
             cmd.env(k, v);
         }
 
-        let cwd = p.cwd.clone().unwrap_or_else(userenv::home);
+        let cwd = p.cwd.clone().unwrap_or_else(userenv::harness_cwd);
         cmd.cwd(&cwd);
 
         let child = pair
@@ -298,17 +298,18 @@ impl SessionManager {
         let session = Session::spawn(id.clone(), &p, self.askpass.as_deref())?;
 
         let mut sessions = self.sessions.lock().unwrap();
-        // Enforce the cap by evicting the oldest session (dropping it kills the
-        // child). Done before insert so the count stays bounded.
+        // Enforce the cap by evicting the best victim (dropping it kills the
+        // child): exited sessions first, then the most-idle one — never a
+        // session that's actively in use just because it's old.
         let mut evicted = None;
         if sessions.len() >= self.max_sessions
-            && let Some(oldest) = sessions
+            && let Some(victim) = sessions
                 .values()
-                .min_by_key(|s| s.created)
+                .max_by_key(|s| (s.is_exited(), s.idle()))
                 .map(|s| s.id.clone())
         {
-            sessions.remove(&oldest);
-            evicted = Some(oldest);
+            sessions.remove(&victim);
+            evicted = Some(victim);
         }
         sessions.insert(id, Arc::clone(&session));
         Ok(OpenResult { session, evicted })
@@ -426,14 +427,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evicts_oldest_at_cap() {
+    async fn evicts_most_idle_at_cap() {
         let m = SessionManager::new(Duration::from_secs(600), 1000, 2, None);
         let a = m.open(params()).unwrap();
         assert!(a.evicted.is_none());
-        let _b = m.open(params()).unwrap();
+        // Touch nothing on a; write to b so it's the recently-active one.
+        let b = m.open(params()).unwrap();
+        b.session.write(b"true\r\n").unwrap();
         let c = m.open(params()).unwrap(); // over cap of 2
         assert_eq!(c.evicted.as_deref(), Some(a.session.id.as_str()));
         assert_eq!(m.list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn evicts_exited_before_idle() {
+        let m = SessionManager::new(Duration::from_secs(600), 1000, 2, None);
+        let a = m.open(params()).unwrap(); // oldest + most idle, but alive
+        let b = m.open(params()).unwrap();
+        b.session.write(b"exit\r\n").unwrap();
+        let re = regex::Regex::new("never-matches").unwrap();
+        b.session
+            .wait(Some(&re), Duration::ZERO, Duration::from_secs(5))
+            .await;
+        assert!(b.session.is_exited());
+        let c = m.open(params()).unwrap();
+        assert_eq!(
+            c.evicted.as_deref(),
+            Some(b.session.id.as_str()),
+            "exited session evicted before the idler live one"
+        );
+        assert!(m.get(&a.session.id).is_ok());
     }
 
     #[tokio::test]
