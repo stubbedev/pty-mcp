@@ -2,6 +2,7 @@
 //! passwordless sudo. stdio by default; `--http <addr>` for streamable HTTP.
 
 mod askpass;
+mod attach;
 mod exec;
 mod hook;
 mod keys;
@@ -81,6 +82,13 @@ enum Command {
     #[command(hide = true)]
     Hook,
 
+    /// Attach this terminal to a live PTY session (take over from the agent:
+    /// type a password, drive vim, …). Detach with Ctrl+].
+    Attach {
+        /// Session id, e.g. pty-3 (see the pty_list tool).
+        session_id: String,
+    },
+
     /// Install the Claude Code hook that routes shell commands through pty-mcp
     /// (instead of the built-in Bash tool), so this server actually gets used.
     Install {
@@ -112,6 +120,7 @@ async fn main() -> Result<()> {
                 print,
                 uninstall,
             } => return hook::install(project.clone(), *print, *uninstall),
+            Command::Attach { session_id } => return attach::run_client(session_id),
         }
     }
 
@@ -140,6 +149,10 @@ async fn main() -> Result<()> {
         cli.max_sessions,
         askpass.clone(),
     );
+
+    // Human-takeover socket: `pty-mcp attach <id>` bridges a terminal into a
+    // live session regardless of which harness owns this server.
+    attach::spawn_listener(Arc::clone(&mgr));
 
     match cli.http {
         Some(addr) => serve_http(mgr, askpass, keepalive, &addr).await,

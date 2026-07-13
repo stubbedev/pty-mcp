@@ -27,6 +27,9 @@ struct Shared {
     last_activity: Mutex<Instant>,
     /// `Some(code)` once the child has exited (EOF on the PTY).
     exited: Mutex<Option<i32>>,
+    /// Attached human viewers (`pty-mcp attach`): raw PTY output is teed to
+    /// each. Slow/broken taps are dropped, never allowed to stall the reader.
+    taps: Mutex<Vec<std::os::unix::net::UnixStream>>,
 }
 
 pub struct Session {
@@ -111,6 +114,7 @@ impl Session {
             notify: Notify::new(),
             last_activity: Mutex::new(Instant::now()),
             exited: Mutex::new(None),
+            taps: Mutex::new(Vec::new()),
         });
 
         spawn_reader(reader, Arc::clone(&shared));
@@ -161,6 +165,28 @@ impl Session {
             cursor_col: col,
             alt_screen: emu.alt_screen(),
             exited: *self.shared.exited.lock().unwrap(),
+        }
+    }
+
+    /// Attach a human viewer: send a redraw of the current screen, then
+    /// register the stream so all future PTY output is teed to it. The redraw
+    /// happens under the taps lock so no output chunk can interleave with it.
+    pub fn attach_tap(&self, mut stream: std::os::unix::net::UnixStream) {
+        use std::io::Write as _;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let redraw = {
+            let emu = self.shared.emu.lock().unwrap();
+            let (row, col) = emu.cursor();
+            format!(
+                "\x1b[2J\x1b[H{}\x1b[{};{}H",
+                emu.render(0).replace('\n', "\r\n"),
+                row + 1,
+                col + 1
+            )
+        };
+        let mut taps = self.shared.taps.lock().unwrap();
+        if stream.write_all(redraw.as_bytes()).is_ok() {
+            taps.push(stream);
         }
     }
 
@@ -252,6 +278,13 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>) {
                 Ok(n) => {
                     shared.emu.lock().unwrap().advance(&buf[..n]);
                     *shared.last_activity.lock().unwrap() = Instant::now();
+                    // Tee to attached human viewers; drop any that error or
+                    // stall (1s write timeout) so they can't block this thread.
+                    shared
+                        .taps
+                        .lock()
+                        .unwrap()
+                        .retain_mut(|t| t.write_all(&buf[..n]).is_ok());
                     shared.notify.notify_waiters();
                 }
             }
