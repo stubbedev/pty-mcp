@@ -85,7 +85,12 @@ fn classify(input: &str) -> Option<(String, String, String)> {
         .and_then(Value::as_str)
         .unwrap_or("PreToolUse")
         .to_string();
-    Some((redirect_reason(command, &cwd), cwd, event))
+    // Harness bash tools take a timeout in ms; forward it so the intent survives.
+    let timeout_secs = ti
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .map(|ms| ms.div_ceil(1000));
+    Some((redirect_reason(command, &cwd, timeout_secs), cwd, event))
 }
 
 /// Encode a deny in the shape the calling harness expects. Gemini and our
@@ -142,15 +147,17 @@ fn has_bash_optout(command: &str) -> bool {
     c.ends_with("#bash") || c.ends_with("# bash")
 }
 
-fn redirect_reason(command: &str, cwd: &str) -> String {
-    let cwd_clause = if cwd.is_empty() {
-        String::new()
-    } else {
-        format!(" and cwd={cwd:?}")
-    };
+fn redirect_reason(command: &str, cwd: &str, timeout_secs: Option<u64>) -> String {
+    let mut clauses = String::new();
+    if !cwd.is_empty() {
+        clauses.push_str(&format!(", cwd={cwd:?}"));
+    }
+    if let Some(t) = timeout_secs {
+        clauses.push_str(&format!(", timeout_seconds={t}"));
+    }
     format!(
         "Route shell through pty-mcp: call the mcp__pty-mcp__run tool with \
-         command={command:?}{cwd_clause} instead of the built-in bash tool. \
+         command={command:?}{clauses} instead of the built-in bash tool. \
          run executes in your full login-shell environment (PATH with nix/cargo/etc.) \
          and sends any sudo prompt to the OS password dialog — never your context. \
          To force built-in bash for this one call, append \" #bash\" to the command \
@@ -519,6 +526,18 @@ mod tests {
         assert!(r.contains("/home/x/proj"));
         assert_eq!(cwd, "/home/x/proj");
         assert_eq!(event, "PreToolUse");
+    }
+
+    #[test]
+    fn forwards_timeout_as_seconds() {
+        let ev = json!({
+            "tool_name": "Bash",
+            "cwd": "/x",
+            "tool_input": { "command": "cargo test", "timeout": 90500 },
+        })
+        .to_string();
+        let (r, _, _) = classify(&ev).unwrap();
+        assert!(r.contains("timeout_seconds=91"), "{r}");
     }
 
     #[test]

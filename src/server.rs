@@ -351,7 +351,7 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), defaulting to the project directory you're working in. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. For persistent/interactive programs (REPL, vim, ssh) use pty_open instead."
+        description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), defaulting to the project directory you're working in. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. Huge output keeps the first and LAST lines (build errors survive). On timeout the whole process tree is killed and partial output returned. For interactive programs (REPL, vim, ssh) or long-running work you want to check on while doing other things, use pty_open + pty_wait instead."
     )]
     async fn run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let secs = a.timeout_seconds.unwrap_or(300).min(3600);

@@ -16,9 +16,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::askpass;
 use crate::userenv;
 
-/// Cap each captured stream so a runaway command can't blow up memory or the
-/// model's context.
-pub const MAX_STREAM: usize = 256 * 1024;
+/// Returned-output budget per stream: the first `HEAD_KEEP` bytes plus the last
+/// `TAIL_KEEP`, with the middle elided. Build/test failures print the error at
+/// the END — a head-only cap (what harness bash tools do) loses exactly the
+/// part that matters. Total ≈ 32 KB per stream keeps the model's context sane.
+pub const HEAD_KEEP: usize = 4 * 1024;
+pub const TAIL_KEEP: usize = 28 * 1024;
 
 pub struct ExecOutput {
     pub exit_code: Option<i32>,
@@ -87,8 +90,8 @@ pub async fn run(
         }
     };
 
-    let stdout = cap(&out_task.await.unwrap_or_default());
-    let mut stderr = cap(&err_task.await.unwrap_or_default());
+    let stdout = out_task.await.map(|c| c.render()).unwrap_or_default();
+    let mut stderr = err_task.await.map(|c| c.render()).unwrap_or_default();
     if timed_out {
         if !stderr.is_empty() {
             stderr.push('\n');
@@ -123,18 +126,62 @@ fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
     status.code().or_else(|| status.signal().map(|s| 128 + s))
 }
 
-/// Read a pipe to EOF, keeping only the first ~[`MAX_STREAM`] bytes and
-/// discarding the rest (still reading, so the child never blocks on a full pipe).
-async fn read_capped(mut r: impl AsyncRead + Unpin) -> Vec<u8> {
-    let mut kept = Vec::new();
+/// Head + tail of a stream, with the total byte count. Memory stays bounded at
+/// `HEAD_KEEP + ~TAIL_KEEP` no matter how much the command prints.
+struct Capped {
+    /// First HEAD_KEEP bytes.
+    head: Vec<u8>,
+    /// Rolling window of the bytes after the head (kept ≤ TAIL_KEEP).
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl Capped {
+    fn render(&self) -> String {
+        let elided = self.total - self.head.len() - self.tail.len();
+        if elided == 0 {
+            // head and tail are disjoint and adjacent — this is everything.
+            let mut all = self.head.clone();
+            all.extend_from_slice(&self.tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        // Lossy conversion puts replacement chars at the ragged cut points;
+        // trim them so the marker line stays clean.
+        format!(
+            "{}\n…[{elided} bytes truncated]…\n{}",
+            String::from_utf8_lossy(&self.head).trim_end_matches('\u{FFFD}'),
+            String::from_utf8_lossy(&self.tail).trim_start_matches('\u{FFFD}'),
+        )
+    }
+}
+
+/// Read a pipe to EOF, keeping the first [`HEAD_KEEP`] bytes and a rolling
+/// window of the last [`TAIL_KEEP`] — always draining, so the child never
+/// blocks on a full pipe and a failing build's final error lines survive.
+async fn read_capped(mut r: impl AsyncRead + Unpin) -> Capped {
+    let mut c = Capped {
+        head: Vec::new(),
+        tail: Vec::new(),
+        total: 0,
+    };
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {
-            Ok(0) | Err(_) => return kept,
-            // Allow a little past the cap so `cap()` sees the overflow and
-            // appends its truncation marker.
-            Ok(n) if kept.len() <= MAX_STREAM => kept.extend_from_slice(&buf[..n]),
-            Ok(_) => {}
+            Ok(0) | Err(_) => return c,
+            Ok(n) => {
+                c.total += n;
+                let mut chunk = &buf[..n];
+                if c.head.len() < HEAD_KEEP {
+                    let take = (HEAD_KEEP - c.head.len()).min(chunk.len());
+                    c.head.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                }
+                c.tail.extend_from_slice(chunk);
+                if c.tail.len() > TAIL_KEEP {
+                    let excess = c.tail.len() - TAIL_KEEP;
+                    c.tail.drain(..excess);
+                }
+            }
         }
     }
 }
@@ -170,27 +217,30 @@ pub fn spawn_keepalive(started: std::sync::Arc<AtomicBool>) {
     });
 }
 
-/// UTF-8-lossy, truncated to [`MAX_STREAM`] bytes on a char boundary.
-fn cap(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_STREAM {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut end = MAX_STREAM;
-    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-        end -= 1;
-    }
-    let mut s = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    s.push_str("\n…[truncated]");
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn capped(head: &[u8], tail: &[u8], total: usize) -> Capped {
+        Capped {
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+            total,
+        }
+    }
+
     #[test]
-    fn cap_under_limit_passthrough() {
-        assert_eq!(cap(b"hello"), "hello");
+    fn capped_render_passthrough() {
+        assert_eq!(capped(b"hel", b"lo", 5).render(), "hello");
+        assert_eq!(capped(b"hello", b"", 5).render(), "hello");
+    }
+
+    #[test]
+    fn capped_render_elides_middle() {
+        let out = capped(b"start", b"end", 100).render();
+        assert!(out.starts_with("start\n"));
+        assert!(out.ends_with("\nend"));
+        assert!(out.contains("[92 bytes truncated]"));
     }
 
     #[test]
@@ -203,12 +253,20 @@ mod tests {
         assert!(!mentions_sudo("visudo"));
     }
 
-    #[test]
-    fn cap_truncates_large() {
-        let big = vec![b'a'; MAX_STREAM + 100];
-        let out = cap(&big);
-        assert!(out.len() <= MAX_STREAM + 20);
-        assert!(out.ends_with("[truncated]"));
+    #[tokio::test]
+    async fn read_capped_keeps_head_and_tail() {
+        // 100 KB through an in-memory reader: head intact, tail is the LAST
+        // bytes (where a build failure's error lives), middle elided.
+        let mut data = b"FIRST-LINE\n".to_vec();
+        data.extend(vec![b'x'; 100 * 1024]);
+        data.extend_from_slice(b"\nLAST-ERROR-LINE");
+        let c = read_capped(&data[..]).await;
+        assert_eq!(c.total, data.len());
+        let out = c.render();
+        assert!(out.starts_with("FIRST-LINE"), "head preserved");
+        assert!(out.ends_with("LAST-ERROR-LINE"), "tail preserved");
+        assert!(out.contains("bytes truncated"));
+        assert!(out.len() <= HEAD_KEEP + TAIL_KEEP + 64);
     }
 
     #[tokio::test]
@@ -271,10 +329,10 @@ mod tests {
 
     #[tokio::test]
     async fn huge_output_capped_without_deadlock() {
-        // Way past MAX_STREAM: must truncate, not OOM, and not deadlock on a
-        // full pipe once the cap is hit.
+        // 2 MB of output: must truncate the middle (not OOM, not deadlock on a
+        // full pipe) while the final line — where errors live — survives.
         let out = run(
-            "yes abcdefgh | head -c 2000000",
+            "yes abcdefgh | head -c 2000000; echo FINAL-LINE",
             None,
             Duration::from_secs(30),
             None,
@@ -282,8 +340,9 @@ mod tests {
         .await
         .unwrap();
         assert!(!out.timed_out);
-        assert!(out.stdout.ends_with("[truncated]"), "truncation marker");
-        assert!(out.stdout.len() <= MAX_STREAM + 8192 + 20);
+        assert!(out.stdout.contains("bytes truncated"), "middle elided");
+        assert!(out.stdout.trim_end().ends_with("FINAL-LINE"), "tail kept");
+        assert!(out.stdout.len() <= HEAD_KEEP + TAIL_KEEP + 64);
     }
 
     #[tokio::test]

@@ -91,6 +91,10 @@ lets Bash through rather than stranding commands with a redirect to a missing to
 Escape hatches (the hook lets these through to built-in Bash): append ` #bash` to a
 command, or set `run_in_background`.
 
+To avoid a permission prompt on every redirected command, allowlist the tool once —
+e.g. for Claude Code add `mcp__pty-mcp__run` to `permissions.allow` in
+`~/.claude/settings.json` (same trust level you'd grant the built-in Bash tool).
+
 ## Tools
 
 | Tool | What it does |
