@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::askpass;
 use crate::userenv;
@@ -51,27 +52,80 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = cmd.spawn().context("spawn shell")?;
+    // Own process group, so a timeout can kill the whole tree — the shell often
+    // has children (pipelines, build tools) that killing the shell alone would
+    // orphan and leave running forever.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().context("spawn shell")?;
+    let pid = child.id();
     let used_sudo = command.split_whitespace().any(|t| t == "sudo");
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(res) => {
-            let out = res.context("wait for command")?;
-            Ok(ExecOutput {
-                exit_code: out.status.code(),
-                stdout: cap(&out.stdout),
-                stderr: cap(&out.stderr),
-                timed_out: false,
-                used_sudo,
-            })
+    // Stream both pipes concurrently, keeping at most MAX_STREAM and draining
+    // the rest, so a huge-output command can neither blow up memory (the old
+    // wait_with_output buffered everything) nor deadlock on a full pipe.
+    let out_task = tokio::spawn(read_capped(child.stdout.take().context("take stdout")?));
+    let err_task = tokio::spawn(read_capped(child.stderr.take().context("take stderr")?));
+
+    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(res) => (res.context("wait for command")?, false),
+        Err(_) => {
+            // Kill the process group; the readers then hit EOF and finish, so
+            // whatever the command printed before the deadline is still returned.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+            }
+            let status = child.wait().await.context("reap after kill")?;
+            (status, true)
         }
-        Err(_) => Ok(ExecOutput {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("timed out after {}s", timeout.as_secs()),
-            timed_out: true,
-            used_sudo,
-        }),
+    };
+
+    let stdout = cap(&out_task.await.unwrap_or_default());
+    let mut stderr = cap(&err_task.await.unwrap_or_default());
+    if timed_out {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!(
+            "[timed out after {}s — process group killed]",
+            timeout.as_secs()
+        ));
+    }
+    Ok(ExecOutput {
+        exit_code: if timed_out { None } else { exit_code(&status) },
+        stdout,
+        stderr,
+        timed_out,
+        used_sudo,
+    })
+}
+
+/// Exit code, mapping death-by-signal to the shell convention `128 + signal`.
+fn exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().or_else(|| status.signal().map(|s| 128 + s))
+}
+
+/// Read a pipe to EOF, keeping only the first ~[`MAX_STREAM`] bytes and
+/// discarding the rest (still reading, so the child never blocks on a full pipe).
+async fn read_capped(mut r: impl AsyncRead + Unpin) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => return kept,
+            // Allow a little past the cap so `cap()` sees the overflow and
+            // appends its truncation marker.
+            Ok(n) if kept.len() <= MAX_STREAM => kept.extend_from_slice(&buf[..n]),
+            Ok(_) => {}
+        }
     }
 }
 
@@ -171,6 +225,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_tree_and_returns_partial_output() {
+        let t0 = std::time::Instant::now();
+        // `exec` replaces the shell, so this also proves group-kill reaches the
+        // real process, and the early echo proves partial output survives.
+        let out = run(
+            "echo started; exec sleep 30",
+            None,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(out.stdout.contains("started"), "partial stdout kept");
+        assert!(out.stderr.contains("timed out"), "stderr: {:?}", out.stderr);
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "killed promptly, not after 30s"
+        );
+    }
+
+    #[tokio::test]
+    async fn huge_output_capped_without_deadlock() {
+        // Way past MAX_STREAM: must truncate, not OOM, and not deadlock on a
+        // full pipe once the cap is hit.
+        let out = run(
+            "yes abcdefgh | head -c 2000000",
+            None,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!out.timed_out);
+        assert!(out.stdout.ends_with("[truncated]"), "truncation marker");
+        assert!(out.stdout.len() <= MAX_STREAM + 8192 + 20);
+    }
+
+    #[tokio::test]
+    async fn signal_death_reported_as_128_plus() {
+        let out = run("kill -TERM $$", None, Duration::from_secs(10), None)
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(128 + 15));
     }
 
     #[tokio::test]

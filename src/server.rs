@@ -48,7 +48,7 @@ pub struct OpenArgs {
     /// Shell/program to run. Defaults to $SHELL, else /bin/sh.
     #[serde(default)]
     pub shell: Option<String>,
-    /// Working directory. Defaults to the server's cwd.
+    /// Working directory. Defaults to the user's home.
     #[serde(default)]
     pub cwd: Option<String>,
     /// Terminal columns (default 120).

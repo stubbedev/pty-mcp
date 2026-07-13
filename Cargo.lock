@@ -910,6 +910,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "libc",
  "portable-pty",
  "regex",
  "rmcp",

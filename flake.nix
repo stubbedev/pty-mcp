@@ -19,8 +19,8 @@
           # pins it so the sandboxed build is reproducible. Bump after any
           # dependency change (Cargo.lock churn) — `nix build` prints the
           # expected hash on mismatch. `just sync-flake` automates this.
-          # cargo-lock: 0949f5c7e9bd1226bd98c0efad498b3a93220f83018a5c87ba004d91cab81ba9
-          cargoHash = "sha256-J2+znW+DV8MPSz/QwV86eKo1v5lGbtSNOyk6cJ+3ZYE=";
+          # cargo-lock: 55f855cd0e632148084f12096ee66c41c8342c1a75c43c321e5768d81a5cfecd
+          cargoHash = "sha256-SwYoVz4lkW6Kg5lyDhlg1hyucsLkMxdUv+Y1uAYOfV4=";
           # The PTY integration tests spawn /bin/sh, which the Nix build
           # sandbox doesn't provide — they fail there for lack of a shell,
           # not lack of correctness. `cargo test` in CI (real environment)
