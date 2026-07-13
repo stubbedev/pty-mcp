@@ -118,10 +118,10 @@ drive vim, fix something by hand — then hand control back to the agent:
 pty-mcp attach pty-3     # Ctrl+] to detach
 ```
 
-`pty_open`/`pty_list` expose the command as `user_takeover_command`, and the
-server instructs the model to surface it whenever a session needs input only a
-human can give. Works the same under every harness: the bridge is a local unix
-socket (0700 runtime dir), fully out-of-band from the MCP transport.
+`pty_open`/`pty_list` expose the command as `user_takeover_command`. The model
+is instructed to share it only when you explicitly ask to take over a session —
+never offered unprompted. Works the same under every harness: the bridge is a
+local unix socket (0700 runtime dir), fully out-of-band from the MCP transport.
 
 Use `run` for one-shot commands ("build the project", "install a package"), and
 `pty_open` + friends when you need to *drive* something interactive (a REPL,

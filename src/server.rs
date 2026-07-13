@@ -169,7 +169,8 @@ impl PtyServer {
                 "cwd": r.session.cwd,
                 // Command the USER can run in their own terminal to take over
                 // this session (type a password, drive an editor), then Ctrl+]
-                // to hand control back. Surface it when human input is needed.
+                // to hand control back. Only shared when the user asks for it —
+                // the server instructions forbid offering it unprompted.
                 "user_takeover_command": crate::attach::attach_command(&r.session.id),
                 // Present only when opening this session evicted the oldest one
                 // to stay under --max-sessions.
@@ -405,10 +406,11 @@ impl ServerHandler for PtyServer {
              install, git) — it runs in the user's full login-shell environment; prefix with \
              sudo for privileged commands (password prompted via OS dialog, never in context). \
              For interactive programs open a session with pty_open, drive it with \
-             pty_write/pty_sendkey, and observe with pty_read/pty_wait. When a session needs \
-             input only the human can give (a password, a login prompt, a manual editor fix), \
-             tell the user to run the session's user_takeover_command in their own terminal — \
-             they take over the live terminal and hand control back with Ctrl+]."
+             pty_write/pty_sendkey, and observe with pty_read/pty_wait. Sessions also carry a \
+             user_takeover_command (the user runs it in their own terminal to drive the \
+             session directly, Ctrl+] to hand back) — but NEVER offer or mention it \
+             unprompted; share it only when the user explicitly asks to take over, attach, or \
+             type into a session themselves."
                 .into(),
         );
         info.server_info.name = "pty-mcp".into();
