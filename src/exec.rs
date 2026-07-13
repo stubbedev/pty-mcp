@@ -7,6 +7,7 @@
 //! wrapper (see [`crate::askpass`]); the password never reaches the model.
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -73,15 +74,25 @@ pub async fn run(
     let pid = child.id();
     let used_sudo = mentions_sudo(command);
 
-    // Stream both pipes concurrently, keeping at most MAX_STREAM and draining
-    // the rest, so a huge-output command can neither blow up memory (the old
+    // Stream both pipes concurrently, keeping head+tail and draining the rest,
+    // so a huge-output command can neither blow up memory (the old
     // wait_with_output buffered everything) nor deadlock on a full pipe.
-    let out_task = tokio::spawn(read_capped(child.stdout.take().context("take stdout")?));
-    let err_task = tokio::spawn(read_capped(child.stderr.take().context("take stderr")?));
+    // `last_output` tracks when the command last printed anything, so a timeout
+    // can report how long it had been silent.
+    let last_output = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let out_task = tokio::spawn(read_capped(
+        child.stdout.take().context("take stdout")?,
+        Arc::clone(&last_output),
+    ));
+    let err_task = tokio::spawn(read_capped(
+        child.stderr.take().context("take stderr")?,
+        Arc::clone(&last_output),
+    ));
 
-    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(res) => (res.context("wait for command")?, false),
+    let (status, timed_out, silent_for) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(res) => (res.context("wait for command")?, false, Duration::ZERO),
         Err(_) => {
+            let silent = last_output.lock().unwrap().elapsed();
             // Kill the process group; the readers then hit EOF and finish, so
             // whatever the command printed before the deadline is still returned.
             #[cfg(unix)]
@@ -89,7 +100,7 @@ pub async fn run(
                 unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
             }
             let status = child.wait().await.context("reap after kill")?;
-            (status, true)
+            (status, true, silent)
         }
     };
 
@@ -100,10 +111,13 @@ pub async fn run(
             stderr.push('\n');
         }
         stderr.push_str(&format!(
-            "[timed out after {}s — process group killed. If the command was \
-             waiting for input, re-run it via pty_open + pty_write so you can \
-             answer its prompt; otherwise retry with a larger timeout_seconds.]",
-            timeout.as_secs()
+            "[timed out after {}s — process group killed; no output for the \
+             final {}s. Long silence from the start suggests it was waiting \
+             for input — re-run via pty_open + pty_write so you can answer its \
+             prompt. If it was still printing, retry with a larger \
+             timeout_seconds.]",
+            timeout.as_secs(),
+            silent_for.as_secs(),
         ));
     }
     Ok(ExecOutput {
@@ -163,7 +177,11 @@ impl Capped {
 /// Read a pipe to EOF, keeping the first [`HEAD_KEEP`] bytes and a rolling
 /// window of the last [`TAIL_KEEP`] — always draining, so the child never
 /// blocks on a full pipe and a failing build's final error lines survive.
-async fn read_capped(mut r: impl AsyncRead + Unpin) -> Capped {
+/// Stamps `last_output` on every chunk for the timeout's silence report.
+async fn read_capped(
+    mut r: impl AsyncRead + Unpin,
+    last_output: Arc<std::sync::Mutex<std::time::Instant>>,
+) -> Capped {
     let mut c = Capped {
         head: Vec::new(),
         tail: Vec::new(),
@@ -174,6 +192,7 @@ async fn read_capped(mut r: impl AsyncRead + Unpin) -> Capped {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => return c,
             Ok(n) => {
+                *last_output.lock().unwrap() = std::time::Instant::now();
                 c.total += n;
                 let mut chunk = &buf[..n];
                 if c.head.len() < HEAD_KEEP {
@@ -265,7 +284,11 @@ mod tests {
         let mut data = b"FIRST-LINE\n".to_vec();
         data.extend(vec![b'x'; 100 * 1024]);
         data.extend_from_slice(b"\nLAST-ERROR-LINE");
-        let c = read_capped(&data[..]).await;
+        let c = read_capped(
+            &data[..],
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        )
+        .await;
         assert_eq!(c.total, data.len());
         let out = c.render();
         assert!(out.starts_with("FIRST-LINE"), "head preserved");

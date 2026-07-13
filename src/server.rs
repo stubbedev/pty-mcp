@@ -257,7 +257,7 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Read the current screen of a session: rendered terminal text, cursor position, whether an alt-screen app (vim/htop) is active, and exit status if the shell has ended."
+        description = "Read the current screen of a session: rendered terminal text, cursor position, whether an alt-screen app (vim/htop) is active, and exit status if the shell has ended. If the screen is identical to your previous pty_read it returns {unchanged: true} instead of re-sending it — cheap to poll."
     )]
     async fn pty_read(
         &self,
@@ -268,6 +268,13 @@ impl PtyServer {
             Err(e) => return Ok(err(e.to_string())),
         };
         let snap = s.snapshot(a.scrollback_lines.unwrap_or(0));
+        if s.same_as_last_read(&snap.screen) {
+            return Ok(json(serde_json::json!({
+                "unchanged": true,
+                "alt_screen": snap.alt_screen,
+                "exited": snap.exited,
+            })));
+        }
         Ok(json(serde_json::json!({
             "screen": snap.screen,
             "cursor": { "row": snap.cursor_row, "col": snap.cursor_col },
@@ -277,7 +284,7 @@ impl PtyServer {
     }
 
     #[tool(
-        description = "Block until a session's output matches `pattern` (regex), or — if no pattern is given — until output has been quiet for `quiet_ms`. Returns the screen. Useful before reading the result of a slow command."
+        description = "Block until a session's output matches `pattern` (regex), or — if no pattern is given — until output has been quiet for `quiet_ms`. Also returns immediately if the session's process exits. Returns the screen. Useful before reading the result of a slow command, and for watching long-running work without polling."
     )]
     async fn pty_wait(
         &self,

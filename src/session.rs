@@ -38,6 +38,9 @@ pub struct Session {
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     shared: Arc<Shared>,
+    /// Hash of the screen last returned by `pty_read`, so an unchanged screen
+    /// can be reported as such instead of re-sent (polling TUIs bloats context).
+    last_read: Mutex<Option<u64>>,
 }
 
 pub struct OpenParams {
@@ -122,6 +125,7 @@ impl Session {
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
             shared,
+            last_read: Mutex::new(None),
         }))
     }
 
@@ -158,6 +162,16 @@ impl Session {
             alt_screen: emu.alt_screen(),
             exited: *self.shared.exited.lock().unwrap(),
         }
+    }
+
+    /// Record the screen hash `pty_read` is about to return; true if it's the
+    /// same screen as the previous `pty_read` (nothing changed since).
+    pub fn same_as_last_read(&self, screen: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        screen.hash(&mut h);
+        let hash = h.finish();
+        self.last_read.lock().unwrap().replace(hash) == Some(hash)
     }
 
     pub fn idle(&self) -> Duration {
@@ -345,6 +359,10 @@ impl SessionManager {
             return;
         }
         tokio::spawn(async move {
+            // Keep exited sessions around for a grace period: a crashed process's
+            // final screen is the post-mortem, and reaping it on the next tick
+            // would erase the evidence before the agent reads it.
+            const EXITED_GRACE: Duration = Duration::from_secs(300);
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
@@ -352,7 +370,10 @@ impl SessionManager {
                     let sessions = self.sessions.lock().unwrap();
                     sessions
                         .values()
-                        .filter(|s| s.idle() > self.idle_timeout || s.is_exited())
+                        .filter(|s| {
+                            s.idle() > self.idle_timeout
+                                || (s.is_exited() && s.idle() > EXITED_GRACE)
+                        })
                         .map(|s| s.id.clone())
                         .collect()
                 };
@@ -468,6 +489,22 @@ mod tests {
                 .await
         );
         assert!(s.snapshot(0).screen.contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn read_dedup_detects_unchanged_screen() {
+        let s = mgr().open(params()).unwrap().session;
+        s.write(b"printf stable\r\n").unwrap();
+        let re = regex::Regex::new("stable").unwrap();
+        s.wait(Some(&re), Duration::ZERO, Duration::from_secs(5))
+            .await;
+        let screen = s.snapshot(0).screen;
+        assert!(!s.same_as_last_read(&screen), "first read is fresh");
+        assert!(s.same_as_last_read(&screen), "second identical read dedups");
+        assert!(
+            !s.same_as_last_read("different"),
+            "changed screen is fresh again"
+        );
     }
 
     #[tokio::test]

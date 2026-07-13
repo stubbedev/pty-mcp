@@ -140,6 +140,12 @@ pty-mcp --askpass 'rofi -dmenu -password -p sudo'
 Without `--askpass`, it autodetects an ssh-askpass-style helper (`ksshaskpass`,
 `ssh-askpass`, …), then `kdialog`, then `zenity`.
 
+## Caveats
+
+Terminal output is untrusted input: anything a command prints (including output
+crafted by a malicious package or repo) lands in the agent's context. pty-mcp
+renders it faithfully; review what your agent runs, same as with any shell tool.
+
 ## Development
 
 ```sh
