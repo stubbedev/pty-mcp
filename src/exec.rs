@@ -55,13 +55,16 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Own process group, so a timeout can kill the whole tree — the shell often
-    // has children (pipelines, build tools) that killing the shell alone would
-    // orphan and leave running forever.
+    // New session: (a) own process group, so a timeout can kill the whole tree
+    // — the shell often has children (pipelines, build tools) that killing the
+    // shell alone would orphan; (b) no controlling terminal, so programs that
+    // prompt via /dev/tty (git credentials, ssh passwords) fail immediately
+    // with a readable error instead of hanging until the timeout — or worse,
+    // writing their prompt into the user's terminal under the harness TUI.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
+            libc::setsid();
             Ok(())
         });
     }
@@ -97,7 +100,9 @@ pub async fn run(
             stderr.push('\n');
         }
         stderr.push_str(&format!(
-            "[timed out after {}s — process group killed]",
+            "[timed out after {}s — process group killed. If the command was \
+             waiting for input, re-run it via pty_open + pty_write so you can \
+             answer its prompt; otherwise retry with a larger timeout_seconds.]",
             timeout.as_secs()
         ));
     }
@@ -343,6 +348,25 @@ mod tests {
         assert!(out.stdout.contains("bytes truncated"), "middle elided");
         assert!(out.stdout.trim_end().ends_with("FINAL-LINE"), "tail kept");
         assert!(out.stdout.len() <= HEAD_KEEP + TAIL_KEEP + 64);
+    }
+
+    #[tokio::test]
+    async fn tty_prompts_fail_fast_instead_of_hanging() {
+        // setsid detaches the controlling terminal, so a /dev/tty prompt (git
+        // credentials, ssh password) errors immediately — it must not sit
+        // there until the timeout.
+        let t0 = std::time::Instant::now();
+        let out = run(
+            "read -r x < /dev/tty && echo got:$x",
+            None,
+            Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!out.timed_out, "must fail fast, not hang: {:?}", out.stderr);
+        assert_ne!(out.exit_code, Some(0));
+        assert!(t0.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
