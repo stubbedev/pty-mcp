@@ -13,14 +13,14 @@
 
         pty-mcp = pkgs.rustPlatform.buildRustPackage {
           pname = "pty-mcp";
-          version = "0.0.4";
+          version = "0.0.5";
           src = ./.;
           # rustPlatform hashes the fetched+vendored crate tree; `cargoHash`
           # pins it so the sandboxed build is reproducible. Bump after any
           # dependency change (Cargo.lock churn) — `nix build` prints the
           # expected hash on mismatch. `just sync-flake` automates this.
-          # cargo-lock: e911ce06fbbd70130f515640e185e6ccf877c75a6658ee24c3f56466c840c346
-          cargoHash = "sha256-Mr1bIwEiFwEVbLDbAqvWxrrzg2jVXfsnrMjz+c4MopM=";
+          # cargo-lock: b3720b35511ab612c0a1ee0e1bbb69420443fe54f30bbe012709d6a6c7216b36
+          cargoHash = "sha256-XsfLXjNq94f7sIphaWcM16OWugSiJWsG3Fqtwt94XWw=";
           # The PTY integration tests spawn /bin/sh, which the Nix build
           # sandbox doesn't provide — they fail there for lack of a shell,
           # not lack of correctness. `cargo test` in CI (real environment)
