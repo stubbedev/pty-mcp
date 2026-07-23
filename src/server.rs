@@ -5,8 +5,11 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -366,17 +369,45 @@ impl PtyServer {
     #[tool(
         description = "Preferred way to run one-shot shell commands. Runs exactly as the user would in their own terminal: their shell, their full environment (PATH matches their interactive shell — nix, cargo, custom bins), defaulting to the project directory you're working in. Pipes/globs/&&/quoting all work. Prefix with sudo for privileged commands — the password is entered in an OS dialog, never in your context. Huge output keeps the first and LAST lines (build errors survive). On timeout the whole process tree is killed and partial output returned. For interactive programs (REPL, vim, ssh) or long-running work you want to check on while doing other things, use pty_open + pty_wait instead."
     )]
-    async fn run(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn run(
+        &self,
+        Parameters(a): Parameters<RunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
         let secs = a.timeout_seconds.unwrap_or(300).min(3600);
         tracing::info!(command = %a.command, "run");
-        match exec::run(
+        // Heartbeat: while the command runs, send progress notifications so the
+        // client keeps resetting its per-request timeout — otherwise a long
+        // command (or a sudo password dialog) dies at the client's deadline
+        // long before our own `timeout_seconds`. Only possible when the client
+        // asked for progress by sending a progressToken.
+        let heartbeat = ctx.meta.get_progress_token().map(|token| {
+            let peer = ctx.peer.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(10));
+                tick.tick().await; // first tick is immediate; skip it
+                for n in 1u64.. {
+                    tick.tick().await;
+                    let _ = peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(token.clone(), n as f64)
+                                .with_message(format!("still running ({}s)", n * 10)),
+                        )
+                        .await;
+                }
+            })
+        });
+        let result = exec::run(
             &a.command,
             a.cwd.as_deref(),
             Duration::from_secs(secs),
             self.askpass.as_deref(),
         )
-        .await
-        {
+        .await;
+        if let Some(h) = heartbeat {
+            h.abort();
+        }
+        match result {
             Ok(out) => {
                 // After a successful sudo command, optionally hold the
                 // timestamp for the rest of the session so later sudo commands

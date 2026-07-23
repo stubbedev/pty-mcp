@@ -72,6 +72,12 @@ pub async fn run(
 
     let mut child = cmd.spawn().context("spawn shell")?;
     let pid = child.id();
+    // If this future is dropped mid-wait (client cancelled the MCP request),
+    // kill the whole process group — kill_on_drop would only reach the shell,
+    // leaving its setsid'd children (e.g. a sudo du) running with nobody
+    // reading their output. Disarmed after the child is reaped, since the pgid
+    // may then be reused.
+    let mut group_kill = GroupKill(pid.map(|p| p as i32));
     let used_sudo = mentions_sudo(command);
 
     // Stream both pipes concurrently, keeping head+tail and draining the rest,
@@ -103,6 +109,7 @@ pub async fn run(
             (status, true, silent)
         }
     };
+    group_kill.0 = None;
 
     let stdout = out_task.await.map(|c| c.render()).unwrap_or_default();
     let mut stderr = err_task.await.map(|c| c.render()).unwrap_or_default();
@@ -127,6 +134,18 @@ pub async fn run(
         timed_out,
         used_sudo,
     })
+}
+
+/// SIGKILLs a process group on drop unless disarmed (set to `None`).
+struct GroupKill(Option<i32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.0 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
 }
 
 /// Does the command line invoke sudo? Split on whitespace AND shell operators,
@@ -390,6 +409,40 @@ mod tests {
         assert!(!out.timed_out, "must fail fast, not hang: {:?}", out.stderr);
         assert_ne!(out.exit_code, Some(0));
         assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_kills_process_group() {
+        // Dropping the run future mid-flight (MCP client cancelled) must kill
+        // the whole process group, not leak the command.
+        let marker = std::env::temp_dir().join(format!("pty-mcp-dropkill-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let cmd = format!("echo $$ > {}; exec sleep 30", marker.display());
+        let task =
+            tokio::spawn(async move { run(&cmd, None, Duration::from_secs(60), None).await });
+        let mut pid = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&marker)
+                && let Ok(p) = s.trim().parse::<i32>()
+            {
+                pid = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid = pid.expect("command never started");
+        task.abort();
+        let _ = task.await;
+        let mut dead = false;
+        for _ in 0..200 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(dead, "process {pid} still alive after future dropped");
     }
 
     #[tokio::test]
