@@ -386,7 +386,9 @@ impl PtyServer {
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(10));
                 tick.tick().await; // first tick is immediate; skip it
-                for n in 1u64.. {
+                // Upper bound is formal only — the task is aborted as soon as the
+                // command returns, so `n` never gets past `timeout_seconds / 10`.
+                for n in 1u64..=u64::MAX {
                     tick.tick().await;
                     let _ = peer
                         .notify_progress(
