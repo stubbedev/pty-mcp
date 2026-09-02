@@ -485,7 +485,14 @@ mod tests {
         let m = SessionManager::new(Duration::from_secs(600), 1000, 2, None);
         let a = m.open(params()).unwrap();
         assert!(a.evicted.is_none());
-        // Touch nothing on a; write to b so it's the recently-active one.
+        // The reader task bumps last_activity on *any* pty output, not just on
+        // writes, so let a's shell finish printing its prompt before touching
+        // b. Otherwise a's startup chatter can land after b's write and make a
+        // the more recently active of the two — which evicts b instead.
+        a.session
+            .wait(None, Duration::from_millis(100), Duration::from_secs(5))
+            .await;
+        // Touch nothing else on a; write to b so it's the recently-active one.
         let b = m.open(params()).unwrap();
         b.session.write(b"true\r\n").unwrap();
         let c = m.open(params()).unwrap(); // over cap of 2
