@@ -50,6 +50,14 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # Substitute from the self-hosted xilo cache. This must be set at
+          # install time: the `xilo use` step later in the job rewrites nix.conf
+          # only after the build has already run, so the cache was previously
+          # written to but never read from.
+          extra-conf: |
+            extra-substituters = https://nix.stubbe.dev/c/default/default
+            extra-trusted-public-keys = default:6uWvXutL9cXjV3lii+Ur5ff+ArQoG4kMBKNXWrIxhHg=
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock', '**/Cargo.lock', '**/go.sum') }}
@@ -114,8 +122,8 @@ jobs:
       - run: nix flake check --print-build-logs
 
       # Push the built package closure to the self-hosted xilo cache on
-      # default-branch pushes. Best-effort: a cache-push failure must not
-      # redden CI.
+      # default-branch pushes. A failed push is not swallowed: it would leave
+      # every consumer rebuilding from source, so the step fails the job.
       - name: setup xilo
         if: github.event_name == 'push'
         uses: stubbedev/xilo@v1
@@ -126,7 +134,6 @@ jobs:
 
       - name: push nix build to xilo
         if: github.event_name == 'push'
-        continue-on-error: true
         run: |
           OUT=$(nix build .#pty-mcp --no-link --print-out-paths)
           xilo push default $OUT
