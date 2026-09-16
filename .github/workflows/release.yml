@@ -145,7 +145,7 @@ jobs:
       - name: Check out homebrew tap
         uses: actions/checkout@v7
         with:
-          repository: stubbedev/homebrew-pty-mcp
+          repository: stubbedev/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
