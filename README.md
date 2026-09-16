@@ -19,6 +19,7 @@ Linux and macOS. No Windows/ConPTY yet.
 ## Install
 
 ```sh
+brew tap stubbedev/tap
 brew install stubbedev/tap/pty-mcp     # homebrew tap
 # or
 nix run github:stubbedev/pty-mcp           # nix flake
