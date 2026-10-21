@@ -158,7 +158,7 @@ impl Drop for RawGuard {
 /// terminal into it raw, detach with Ctrl+].
 pub fn run_client(session_id: &str) -> Result<()> {
     let mut stream = connect(session_id)?;
-    eprintln!("[attached to {session_id} — Ctrl+] to detach]");
+    eprintln!("[attached — Ctrl+] to detach]");
     let guard = RawGuard::enter();
 
     // Keystrokes → socket, on its own thread; Ctrl+] stops everything.
@@ -197,7 +197,7 @@ pub fn run_client(session_id: &str) -> Result<()> {
         }
     }
     drop(guard);
-    eprintln!("\n[detached from {session_id}]");
+    eprintln!("\n[detached]");
     Ok(())
 }
 
