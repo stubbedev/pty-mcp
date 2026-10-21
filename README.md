@@ -171,7 +171,7 @@ just check        # lint + test + flake sync
 just release-patch / release-minor / release-major
 ```
 
-Releases are tag-driven (`vX.Y.Z`): GitHub Actions builds static musl + macOS
+Releases are tag-driven (`vX.Y.Z`): GitHub Actions builds static musl + Apple Silicon macOS
 binaries, publishes a GitHub release, pushes the nix closure to the attic cache,
 and bumps the homebrew tap formula.
 
