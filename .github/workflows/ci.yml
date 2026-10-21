@@ -68,16 +68,16 @@ jobs:
           purge-primary-key: never
           gc-max-store-size-linux: 5G
 
-      # Inline sync-flake: rewrite flake.nix's cargoHash to match the
+      # Inline sync-flake: rewrite nix/package.nix's cargoHash to match the
       # current Cargo.lock. On default-branch pushes the result is
       # auto-committed; on PRs we fail if it would change anything, so
       # reviewers see the drift instead of CI silently masking it.
-      - name: sync flake.nix cargoHash
+      - name: sync nix/package.nix cargoHash
         run: |
           set -euo pipefail
           LOCK_HASH=$(sha256sum Cargo.lock | awk '{print $1}')
           SENTINEL="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-          sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
+          sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' nix/package.nix
           set +e
           OUT=$(nix build .#pty-mcp --no-link 2>&1)
           BUILD_STATUS=$?
@@ -93,30 +93,30 @@ jobs:
             echo "::error::sync-flake: nix build did not print 'got: sha256-…'"
             exit 1
           fi
-          sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
-          sed -i -E 's|^(\s*# cargo-lock:).*|\1 '"$LOCK_HASH"'|' flake.nix
+          sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' nix/package.nix
+          sed -i -E 's|^(\s*# cargo-lock:).*|\1 '"$LOCK_HASH"'|' nix/package.nix
           echo "sync-flake: cargoHash=$NEW_HASH cargo-lock=$LOCK_HASH"
 
-      - name: assert flake.nix in sync (PR)
+      - name: assert nix/package.nix in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain flake.nix)" ]; then
-            echo "::error::flake.nix cargoHash is out of sync with Cargo.lock. Run 'just sync-flake' locally and commit the result."
-            git --no-pager diff flake.nix
+          if [ -n "$(git status --porcelain nix/package.nix)" ]; then
+            echo "::error::nix/package.nix cargoHash is out of sync with Cargo.lock. Run 'just sync-flake' locally and commit the result."
+            git --no-pager diff nix/package.nix
             exit 1
           fi
 
-      - name: auto-commit flake.nix bump (default branch)
+      - name: auto-commit nix/package.nix bump (default branch)
         if: github.event_name == 'push'
         run: |
-          if [ -z "$(git status --porcelain flake.nix)" ]; then
-            echo "flake.nix already in sync; nothing to commit."
+          if [ -z "$(git status --porcelain nix/package.nix)" ]; then
+            echo "nix/package.nix already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add flake.nix
-          git commit -m 'chore: auto-bump flake.nix cargoHash [skip ci]'
+          git add nix/package.nix
+          git commit -m 'chore: auto-bump nix/package.nix cargoHash [skip ci]'
           git push origin HEAD:${{ github.ref_name }}
 
       - run: nix flake check --print-build-logs

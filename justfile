@@ -50,10 +50,10 @@ nix-build:
 nix-check:
     nix flake check --print-build-logs
 
-# Keep flake.nix's `cargoHash` aligned with the current Cargo.lock.
+# Keep nix/package.nix's `cargoHash` aligned with the current Cargo.lock.
 #
 # A sha256 of Cargo.lock is embedded as a `# cargo-lock:` line in
-# flake.nix. When the cached digest matches Cargo.lock on disk,
+# nix/package.nix. When the cached digest matches Cargo.lock on disk,
 # sync-flake returns immediately without running `nix build`. That
 # makes it cheap enough to run on every `just check`.
 #
@@ -75,8 +75,8 @@ sync-flake version="":
     esac
 
     LOCK_HASH=$(sha256sum Cargo.lock | awk '{print $1}')
-    CACHED_HASH=$(awk -F': ' '/^[[:space:]]*#[[:space:]]*cargo-lock:/ {print $2; exit}' flake.nix | tr -d ' ')
-    CURRENT_VERSION=$(awk -F'"' '/^[[:space:]]*version = "/ {print $2; exit}' flake.nix)
+    CACHED_HASH=$(awk -F': ' '/^[[:space:]]*#[[:space:]]*cargo-lock:/ {print $2; exit}' nix/package.nix | tr -d ' ')
+    CURRENT_VERSION=$(awk -F'"' '/^[[:space:]]*version = "/ {print $2; exit}' nix/package.nix)
 
     NEED_HASH=0
     NEED_VERSION=0
@@ -96,13 +96,13 @@ sync-flake version="":
     if [ "$NEED_VERSION" = "1" ]; then
         sed -i -E 's|^(version = )"[^"]*"|\1"'"$VERSION"'"|' Cargo.toml
         cargo update -p pty-mcp --precise "$VERSION" 2>/dev/null || cargo generate-lockfile
-        sed -i -E 's|^(\s*version = )"[^"]*";|\1"'"$VERSION"'";|' flake.nix
+        sed -i -E 's|^(\s*version = )"[^"]*";|\1"'"$VERSION"'";|' nix/package.nix
         LOCK_HASH=$(sha256sum Cargo.lock | awk '{print $1}')
         echo "sync-flake: version=$VERSION"
     fi
 
     SENTINEL="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
+    sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' nix/package.nix
     set +e
     OUT=$(nix build .#pty-mcp --no-link 2>&1)
     BUILD_STATUS=$?
@@ -118,13 +118,13 @@ sync-flake version="":
         echo "sync-flake: nix build failed without printing 'got: sha256-…'" >&2
         exit 1
     fi
-    sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
-    sed -i -E 's|^(\s*# cargo-lock:).*|\1 '"$LOCK_HASH"'|' flake.nix
+    sed -i -E 's|^(\s*cargoHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' nix/package.nix
+    sed -i -E 's|^(\s*# cargo-lock:).*|\1 '"$LOCK_HASH"'|' nix/package.nix
     echo "sync-flake: cargoHash=$NEW_HASH cargo-lock=$LOCK_HASH"
 
-    # Hard guard: refuse to leave the sentinel in flake.nix.
-    if grep -q 'cargoHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' flake.nix; then
-        echo "sync-flake: refusing to leave sentinel cargoHash in flake.nix" >&2
+    # Hard guard: refuse to leave the sentinel in nix/package.nix.
+    if grep -q 'cargoHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' nix/package.nix; then
+        echo "sync-flake: refusing to leave sentinel cargoHash in nix/package.nix" >&2
         exit 1
     fi
 
@@ -181,11 +181,11 @@ _release bump:
         patch) NEW="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
         *) echo "unknown bump kind: {{bump}}"; exit 1 ;;
     esac
-    # Bump Cargo.toml + Cargo.lock + flake.nix version and cargoHash,
+    # Bump Cargo.toml + Cargo.lock + nix/package.nix version and cargoHash,
     # re-validating the build, BEFORE tagging.
     just sync-flake "${NEW}"
-    if [ -n "$(git status --porcelain Cargo.toml Cargo.lock flake.nix)" ]; then
-        git add Cargo.toml Cargo.lock flake.nix
+    if [ -n "$(git status --porcelain Cargo.toml Cargo.lock nix/package.nix)" ]; then
+        git add Cargo.toml Cargo.lock nix/package.nix
         git commit -m "chore: bump to v${NEW}"
     fi
     git tag -a "v${NEW}" -m "v${NEW}"
