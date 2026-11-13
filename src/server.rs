@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ProgressNotificationParam, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, ProgressNotificationParam, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -431,8 +431,8 @@ impl PtyServer {
 
 #[tool_handler]
 impl ServerHandler for PtyServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "Preferred shell for this session. Use `run` for one-shot commands (build, test, \
